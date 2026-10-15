@@ -13,6 +13,46 @@ from scipy.sparse import issparse
 import dynamo as dyn
 
 
+def _run_dynamo_dynamics(adata):
+    """Run Dynamo while marking numerically degenerate genes as invalid.
+
+    Dynamo's stochastic regression normally represents an unfit gene with a
+    NaN gamma. For a non-finite 2x2 error covariance, however, NumPy raises
+    ``LinAlgError: SVD did not converge`` before Dynamo can emit that NaN. The
+    downstream spaVelo initialization already filters NaN gamma values, so
+    convert only this per-gene numerical failure to the representation Dynamo
+    and spaVelo expect, and record how many genes were affected.
+    """
+
+    from dynamo.estimation.csc import velocity as dynamo_velocity
+
+    original = dynamo_velocity.fit_stochastic_linreg
+    skipped = 0
+
+    def fit_stochastic_linreg_safe(*args, **kwargs):
+        nonlocal skipped
+        try:
+            return original(*args, **kwargs)
+        except np.linalg.LinAlgError as exc:
+            if "SVD did not converge" not in str(exc):
+                raise
+            skipped += 1
+            return np.nan
+
+    dynamo_velocity.fit_stochastic_linreg = fit_stochastic_linreg_safe
+    try:
+        dyn.tl.dynamics(adata)
+    finally:
+        dynamo_velocity.fit_stochastic_linreg = original
+    adata.uns["spavelo_dynamo_svd_skipped_genes"] = skipped
+
+
+def _expressed_genes(adata, threshold=500):
+    """Return genes above the joint spliced/unspliced total-count threshold."""
+    total = adata.layers["spliced"] + adata.layers["unspliced"]
+    return adata.var_names[np.asarray(total.sum(axis=0)).ravel() > threshold]
+
+
 class UnitVeloGeneSelector:
     def __init__(self, ):
         self.min_ratio = 0.01
@@ -104,7 +144,8 @@ class UnitVeloGeneSelector:
 
 def preprocess_data_real(adata, spatial_layer="spatial", spliced_layer="Ms", unspliced_layer="Mu",
                          log_transform=True, min_max_scale=True, filter_on_r2=True, dtype="float64",
-                         filter_on_ss=False, gene_selection="spatial_hvg", use_raw=False, smooth_pca=False):
+                         filter_on_ss=False, gene_selection="spatial_hvg", use_raw=False, smooth_pca=False,
+                         compute_umap=True, moran_jobs=30):
     """Preprocess data.
 
     This function removes poorly detected genes and minmax scales the data.
@@ -136,12 +177,11 @@ def preprocess_data_real(adata, spatial_layer="spatial", spliced_layer="Ms", uns
     if gene_selection == "spatial_hvg":
         adata_moran = adata.copy()
         adata_hvg = adata.copy()
-        sq.gr.spatial_neighbors(adata_moran, n_neighs=8)
-        expressed_genes = (adata_moran.layers["spliced"].A + adata_moran.layers["unspliced"].A).sum(axis=0) > 500
-        expressed_genes = adata_moran.var_names[expressed_genes]
+        sq.gr.spatial_neighbors(adata_moran, spatial_key=spatial_layer, n_neighs=8)
+        expressed_genes = _expressed_genes(adata_moran)
         sc.pp.normalize_total(adata_moran)
         sc.pp.log1p(adata_moran)
-        sq.gr.spatial_autocorr(adata_moran, mode="moran",  genes=list(expressed_genes), n_perms=100, n_jobs=30)
+        sq.gr.spatial_autocorr(adata_moran, mode="moran",  genes=list(expressed_genes), n_perms=100, n_jobs=moran_jobs)
         scv.pp.filter_and_normalize(adata_hvg, n_top_genes=3000)
         hvg_names = adata_hvg.var.index
         moran_top_gene = adata_moran.uns["moranI"].head(2000).index
@@ -152,12 +192,11 @@ def preprocess_data_real(adata, spatial_layer="spatial", spliced_layer="Ms", uns
             scv.pp.filter_and_normalize(adata)
     elif gene_selection == "spatial_scv":
         adata_moran = adata.copy()
-        sq.gr.spatial_neighbors(adata_moran, n_neighs=8)
-        expressed_genes = (adata_moran.layers["spliced"].A + adata_moran.layers["unspliced"].A).sum(axis=0) > 500
-        expressed_genes = adata_moran.var_names[expressed_genes]
+        sq.gr.spatial_neighbors(adata_moran, spatial_key=spatial_layer, n_neighs=8)
+        expressed_genes = _expressed_genes(adata_moran)
         sc.pp.normalize_total(adata_moran)
         sc.pp.log1p(adata_moran)
-        sq.gr.spatial_autocorr(adata_moran, mode="moran",  genes=list(expressed_genes), n_perms=100, n_jobs=30)
+        sq.gr.spatial_autocorr(adata_moran, mode="moran",  genes=list(expressed_genes), n_perms=100, n_jobs=moran_jobs)
         moran_top_gene = adata_moran.uns["moranI"].head(2000).index
         spatial_gene = list(set(moran_top_gene) & set(expressed_genes))
         adata_scv = adata[:, spatial_gene].copy()
@@ -171,12 +210,11 @@ def preprocess_data_real(adata, spatial_layer="spatial", spliced_layer="Ms", uns
     elif gene_selection == "spatial_unitvelo":
         adata_raw = adata.copy()
         adata_moran = adata.copy()
-        sq.gr.spatial_neighbors(adata_moran, n_neighs=8)
-        expressed_genes = (adata_moran.layers["spliced"].A + adata_moran.layers["unspliced"].A).sum(axis=0) > 500
-        expressed_genes = adata_moran.var_names[expressed_genes]
+        sq.gr.spatial_neighbors(adata_moran, spatial_key=spatial_layer, n_neighs=8)
+        expressed_genes = _expressed_genes(adata_moran)
         sc.pp.normalize_total(adata_moran)
         sc.pp.log1p(adata_moran)
-        sq.gr.spatial_autocorr(adata_moran, mode="moran",  genes=list(expressed_genes), n_perms=100, n_jobs=30)
+        sq.gr.spatial_autocorr(adata_moran, mode="moran",  genes=list(expressed_genes), n_perms=100, n_jobs=moran_jobs)
         moran_top_gene = adata_moran.uns["moranI"].head(2000).index
         spatial_gene = list(set(moran_top_gene) & set(expressed_genes))
         adata_scv = adata[:, spatial_gene].copy()
@@ -193,12 +231,11 @@ def preprocess_data_real(adata, spatial_layer="spatial", spliced_layer="Ms", uns
             scv.pp.filter_and_normalize(adata)
     elif gene_selection == "spatial":
         adata_moran = adata.copy()
-        sq.gr.spatial_neighbors(adata_moran, n_neighs=8)
-        expressed_genes = (adata_moran.layers["spliced"].A + adata_moran.layers["unspliced"].A).sum(axis=0) > 500
-        expressed_genes = adata_moran.var_names[expressed_genes]
+        sq.gr.spatial_neighbors(adata_moran, spatial_key=spatial_layer, n_neighs=8)
+        expressed_genes = _expressed_genes(adata_moran)
         sc.pp.normalize_total(adata_moran)
         sc.pp.log1p(adata_moran)
-        sq.gr.spatial_autocorr(adata_moran, mode="moran",  genes=list(expressed_genes), n_perms=100, n_jobs=30)
+        sq.gr.spatial_autocorr(adata_moran, mode="moran",  genes=list(expressed_genes), n_perms=100, n_jobs=moran_jobs)
         moran_top_gene = adata_moran.uns["moranI"].head(2000).index
         final_gene = sorted(list(set(moran_top_gene) & set(expressed_genes)))
         adata = adata[:, final_gene].copy()
@@ -218,12 +255,11 @@ def preprocess_data_real(adata, spatial_layer="spatial", spliced_layer="Ms", uns
         rep_count = (state_mask < 0).sum(axis=0)
         ind_count = (state_mask > 0).sum(axis=0)
         complete_genes = adata_state.var.index[np.logical_and(rep_count > 0.1 * adata.shape[0], ind_count > 0.1 * adata.shape[0])].to_list()
-        sq.gr.spatial_neighbors(adata_moran, n_neighs=8)
-        expressed_genes = (adata_moran.layers["spliced"].A + adata_moran.layers["unspliced"].A).sum(axis=0) > 500
-        expressed_genes = adata_moran.var_names[expressed_genes]
+        sq.gr.spatial_neighbors(adata_moran, spatial_key=spatial_layer, n_neighs=8)
+        expressed_genes = _expressed_genes(adata_moran)
         sc.pp.normalize_total(adata_moran)
         sc.pp.log1p(adata_moran)
-        sq.gr.spatial_autocorr(adata_moran, mode="moran",  genes=list(expressed_genes), n_perms=100, n_jobs=30)
+        sq.gr.spatial_autocorr(adata_moran, mode="moran",  genes=list(expressed_genes), n_perms=100, n_jobs=moran_jobs)
         moran_top_gene = adata_moran.uns["moranI"].head(2000).index
         final_gene = sorted(list(set(moran_top_gene) & set(expressed_genes) & steady_genes & set(complete_genes)))
         adata = adata[:, final_gene].copy()
@@ -242,12 +278,12 @@ def preprocess_data_real(adata, spatial_layer="spatial", spliced_layer="Ms", uns
         else:
             sc.pp.pca(adata)
             scv.pp.moments(adata)
-    if isinstance(adata.X, scipy.sparse.csr_matrix):
-        adata.X = np.array(adata.X.todense())
-    if isinstance(adata.layers[spliced_layer], scipy.sparse.csr_matrix):
-        adata.layers[spliced_layer] = np.array(adata.layers[spliced_layer].todense())
-    if isinstance(adata.layers[unspliced_layer], scipy.sparse.csr_matrix):
-        adata.layers[unspliced_layer] = np.array(adata.layers[unspliced_layer].todense())
+    if issparse(adata.X):
+        adata.X = adata.X.toarray()
+    if issparse(adata.layers[spliced_layer]):
+        adata.layers[spliced_layer] = adata.layers[spliced_layer].toarray()
+    if issparse(adata.layers[unspliced_layer]):
+        adata.layers[unspliced_layer] = adata.layers[unspliced_layer].toarray()
     adata.layers[spliced_layer] = adata.layers[spliced_layer].astype(dtype)
     adata.layers[unspliced_layer] = adata.layers[unspliced_layer].astype(dtype)
     adata.obsm[spatial_layer] =  adata.obsm[spatial_layer].astype(dtype)
@@ -278,10 +314,8 @@ def preprocess_data_real(adata, spatial_layer="spatial", spliced_layer="Ms", uns
         var_names = adata.var_names[velo._velocity_genes]
         adata.var["fit_r2"] = velo._r2
         adata = adata[:, var_names].copy()
-    adata_umap = adata_raw.copy()
-    # if not use_raw:
-        # scv.pp.filter_and_normalize(adata_umap)
-    adata.obsm["X_umap"] = get_umap(adata_umap, adata.obs.index)
+    if compute_umap:
+        adata.obsm["X_umap"] = get_umap(adata_raw, adata.obs.index)
 
     return adata
 
@@ -338,7 +372,7 @@ def get_init_variables(adata, spliced_layer="Ms", unspliced_layer="Mu", gamma_in
         adata.obs["pass_basic_filter"] = True
         adata.layers["X_spliced"] = adata.layers["spliced"]
         adata.layers["X_unspliced"] = adata.layers["unspliced"]
-        dyn.tl.dynamics(adata)
+        _run_dynamo_dynamics(adata)
         kinetics = pd.DataFrame(adata.varm["vel_params"], columns=adata.uns["vel_params_names"])
         dynamo_gamma_unconstr = (kinetics["gamma"] / kinetics["beta"]).values
         # dynamo_gene_mask = np.logical_and(~np.isnan(dynamo_gamma_unconstr), kinetics["gamma_r2"] > 0)

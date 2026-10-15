@@ -622,7 +622,8 @@ class SPAVELO(nn.Module):
 
     def train_model(self, adata, prior_prob, spatial_layer="spatial", spliced_layer="Ms", unspliced_layer="Mu", lr=0.01, weight_decay=0.001, 
                     batch_size=512, n_samples=1, train_size=0.95, maxiter=5000, patience=200, save_model=True, model_weights="model.pt", 
-                    print_kernel_scale=True, log_dir=".", gamma_r2=None):
+                    print_kernel_scale=True, log_dir=".", gamma_r2=None, verbose=True,
+                    progress_callback=None, recorder_save_every=1):
         """
         Model training.
 
@@ -663,10 +664,8 @@ class SPAVELO(nn.Module):
         # Set data ranges for prior probability calculation
 
         # Create dataset
-        print("Computing velocity-based prior probabilities...")
-        spliced_tensor = torch.tensor(spliced, dtype=self.dtype, device=self.device)
-        unspliced_tensor = torch.tensor(unspliced, dtype=self.dtype, device=self.device)
-        
+        if verbose:
+            print("Computing velocity-based prior probabilities...")
         # Create dataset with prior probabilities
         dataset = TensorDataset(
             torch.tensor(pos, dtype=self.dtype), 
@@ -694,7 +693,8 @@ class SPAVELO(nn.Module):
         queue = deque()
         self.kinetic_recorder = KineticRecoder(result_dir=log_dir, gene=adata.var.index.tolist())
 
-        print("Training")
+        if verbose:
+            print("Training")
 
         for epoch in range(maxiter):
             elbo_val = 0
@@ -719,7 +719,7 @@ class SPAVELO(nn.Module):
                     self.forward(x=x_batch, y_spliced=y_spliced_batch, y_unspliced=y_unspliced_batch, epoch=epoch, n_samples=n_samples, prior_prob=batch_prior_prob, gamma_r2=gamma_r2)
 
                 self.zero_grad()
-                elbo.backward(retain_graph=True)
+                elbo.backward()
                 optimizer.step()
 
                 elbo_val += elbo.item()
@@ -747,17 +747,19 @@ class SPAVELO(nn.Module):
             kl_pi_val = kl_pi_val/num
             kl_gaussian_val = kl_gaussian_val/num
             self.kinetic_recorder.update(self.get_rates(), epoch)
-            self.kinetic_recorder.save()
+            if recorder_save_every and (epoch + 1) % recorder_save_every == 0:
+                self.kinetic_recorder.save()
 
-            print('Training epoch {}, ELBO:{:.8f}, '
-                  'Reconstuction:{:.8f}, '
-                  'End penalty:{:8f}, '
-                  'GP KLD:{:.8f}, '
-                  'PI KLD:{:.8f}, '
-                  'Gaussian KLD:{:.8f}'.format(epoch+1, elbo_val, reconst_loss_val, end_penalty_val, kl_gp_val, kl_pi_val, kl_gaussian_val))
-            print('Current beta', self.KL_beta)
-            if print_kernel_scale:
-                print('Current kernel scale', torch.clamp(F.softplus(self.svgp.kernel.scale), min=1e-10, max=1e4).data)
+            if verbose:
+                print('Training epoch {}, ELBO:{:.8f}, '
+                      'Reconstuction:{:.8f}, '
+                      'End penalty:{:8f}, '
+                      'GP KLD:{:.8f}, '
+                      'PI KLD:{:.8f}, '
+                      'Gaussian KLD:{:.8f}'.format(epoch+1, elbo_val, reconst_loss_val, end_penalty_val, kl_gp_val, kl_pi_val, kl_gaussian_val))
+                print('Current beta', self.KL_beta)
+                if print_kernel_scale:
+                    print('Current kernel scale', torch.clamp(F.softplus(self.svgp.kernel.scale), min=1e-10, max=1e4).data)
 
             if train_size < 1:
                 self.eval()
@@ -780,11 +782,20 @@ class SPAVELO(nn.Module):
 
                 validate_elbo_val = validate_elbo_val / validate_num
 
-                print('Training epoch {}, validating ELBO:{:.8f}'.format(epoch+1, validate_elbo_val))
+                if verbose:
+                    print('Training epoch {}, validating ELBO:{:.8f}'.format(epoch+1, validate_elbo_val))
                 early_stopping(validate_elbo_val, self)
                 if early_stopping.early_stop:
-                    print('EarlyStopping: run {} iteration'.format(epoch+1))
+                    if verbose:
+                        print('EarlyStopping: run {} iteration'.format(epoch+1))
+                    if progress_callback is not None:
+                        progress_callback(epoch + 1, maxiter)
                     break
+
+            if progress_callback is not None:
+                progress_callback(epoch + 1, maxiter)
+
+        self.kinetic_recorder.save()
 
         if save_model:
             torch.save(self.state_dict(), model_weights)
